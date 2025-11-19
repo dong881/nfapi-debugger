@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Log Parser for UE Size Analysis (Advanced v2)
+Log Parser for UE Size Analysis (Advanced v3)
 - Auto-extract throughput from filename
 - English only text to avoid font issues
 - Moving average + original data overlay for noisy data
 - Hide UE ID from filename and chart title
+- Auto-detect and trim stable regions (constant size=5) at start/end
+- Keep the main data section for consistent visualization
 """
 
 import sys
@@ -63,6 +65,62 @@ def parse_log_file(filepath):
         sys.exit(1)
     
     return ue_data
+
+def detect_and_trim_stable_regions(data, stable_threshold=5, min_stable_length=10):
+    """
+    Auto-detect and trim stable regions (constant value) at start and end.
+    
+    Detects where data becomes "interesting" (changes significantly from stable value).
+    This removes the boring setup/teardown phases before and after actual transmission.
+    
+    Args:
+        data: List of dicts with 'size' key
+        stable_threshold: Threshold for detecting stable region (default: size=5)
+        min_stable_length: Minimum consecutive samples to consider a region stable
+    
+    Returns:
+        tuple: (trimmed_data, start_idx, end_idx, trim_info_str)
+    """
+    if len(data) < min_stable_length:
+        return data, 0, len(data), "Data too short, no trimming applied"
+    
+    sizes = np.array([d['size'] for d in data])
+    
+    # Find where data differs from stable_threshold using difference detection
+    # This identifies where the interesting part starts/ends
+    changes = np.abs(np.diff(sizes.astype(float)))
+    
+    # Find significant changes (> 0, meaning size changed from previous)
+    change_indices = np.where(changes > 0)[0]
+    
+    if len(change_indices) == 0:
+        # All data is the same value, no trimming needed
+        return data, 0, len(data), "All data is constant"
+    
+    # The first significant change marks the start of interesting data
+    first_change_idx = change_indices[0]
+    
+    # The last significant change marks around the end of interesting data
+    last_change_idx = change_indices[-1]
+    
+    # Add buffer after last change to include post-change stable region
+    start_trim = max(0, first_change_idx - 2)  # Start from a bit before first change
+    end_trim = min(len(data), last_change_idx + 20)  # Include some data after last change
+    
+    # But ensure we're not trimming too much
+    if end_trim - start_trim < 20:  # Minimum keep 20 samples
+        # Try to keep at least 50% of data if changes are minimal
+        margin = max(len(data) // 4, 10)
+        start_trim = max(0, first_change_idx - margin)
+        end_trim = min(len(data), last_change_idx + margin)
+    
+    trimmed_data = data[start_trim:end_trim]
+    
+    trim_info = f"Trimmed: {start_trim} to {end_trim} (removed {start_trim} from start, {len(data)-end_trim} from end, kept {len(trimmed_data)} samples)"
+    
+    print(f"   TRIM: {trim_info}")
+    
+    return trimmed_data, start_trim, end_trim, trim_info
 
 def extract_throughput_from_filename(log_file):
     """
@@ -158,6 +216,7 @@ def calculate_moving_average(data, window=5):
 def plot_single_ue(ue_id, data, throughput=None, filename_prefix=None, separate=False):
     """
     Plot chart for single UE with moving average overlay
+    Auto-trims stable regions at start/end
     
     Returns:
         str: Saved filename
@@ -166,11 +225,18 @@ def plot_single_ue(ue_id, data, throughput=None, filename_prefix=None, separate=
     import warnings
     warnings.filterwarnings('ignore', category=UserWarning)
     
+    # Auto-detect and trim stable regions
+    trimmed_data, start_idx, end_idx, trim_info = detect_and_trim_stable_regions(data)
+    
+    if len(trimmed_data) < 5:
+        print(f"   ERROR: Not enough data after trimming")
+        return None
+    
     fig, ax = plt.subplots(figsize=(14, 7))
     
     # Prepare data
-    timestamps = [d['timestamp'] for d in data]
-    sizes = [d['size'] for d in data]
+    timestamps = [d['timestamp'] for d in trimmed_data]
+    sizes = [d['size'] for d in trimmed_data]
     
     # Normalize timestamps (start from 0)
     min_timestamp = min(timestamps)
@@ -178,7 +244,7 @@ def plot_single_ue(ue_id, data, throughput=None, filename_prefix=None, separate=
     sizes = np.array(sizes)
     
     # Calculate moving average for smoothing (window = 5)
-    window_size = 10
+    window_size = 5
     if len(sizes) >= window_size:
         smoothed_sizes = calculate_moving_average(sizes, window=window_size)
         smoothed_times = relative_times[window_size-1:]
@@ -244,6 +310,7 @@ def plot_single_ue(ue_id, data, throughput=None, filename_prefix=None, separate=
 def plot_all_ues_combined(ue_data, ues_to_plot, throughput=None, filename_prefix=None):
     """
     Plot multiple UEs in subplots with moving average overlay
+    Auto-trims stable regions
     """
     # Suppress warnings
     import warnings
@@ -273,13 +340,21 @@ def plot_all_ues_combined(ue_data, ues_to_plot, throughput=None, filename_prefix
     
     for idx, ue_id in enumerate(ues_to_plot):
         data = ue_data[ue_id]
+        
+        # Auto-trim stable regions
+        trimmed_data, _, _, _ = detect_and_trim_stable_regions(data)
+        
+        if len(trimmed_data) < 5:
+            print(f"   WARNING: Skipping UE {ue_id}, not enough data after trimming")
+            continue
+        
         row = idx // cols
         col = idx % cols
         ax = axes[row, col]
         
         # Prepare data
-        timestamps = [d['timestamp'] for d in data]
-        sizes = np.array([d['size'] for d in data])
+        timestamps = [d['timestamp'] for d in trimmed_data]
+        sizes = np.array([d['size'] for d in trimmed_data])
         
         # Normalize timestamps
         min_timestamp = min(timestamps)
@@ -337,19 +412,25 @@ def plot_all_ues_combined(ue_data, ues_to_plot, throughput=None, filename_prefix
 
 def print_summary(ue_data, ues_to_plot):
     """
-    Print UE data summary
+    Print UE data summary (before trimming)
     """
     print("\n" + "="*70)
-    print("SUMMARY")
+    print("SUMMARY (After Trimming)")
     print("="*70)
     
     for ue_id in ues_to_plot:
         data = ue_data[ue_id]
-        sizes = [d['size'] for d in data]
-        timestamps = [d['timestamp'] for d in data]
+        
+        # Show trimming info
+        trimmed_data, _, _, trim_info = detect_and_trim_stable_regions(data)
+        
+        sizes = [d['size'] for d in trimmed_data]
+        timestamps = [d['timestamp'] for d in trimmed_data]
         
         print(f"\nUE {ue_id}:")
-        print(f"   Samples: {len(data)}")
+        print(f"   Original: {len(data)} samples")
+        print(f"   {trim_info}")
+        print(f"   Samples: {len(sizes)}")
         print(f"   Mean Size: {np.mean(sizes):.2f} bytes")
         print(f"   Max Size: {np.max(sizes)} bytes")
         print(f"   Min Size: {np.min(sizes)} bytes")
@@ -370,6 +451,11 @@ Usage Examples:
   python3 log_parser.py ./measure-PRB.txt -t 125.5
   python3 log_parser.py ./measure-PRB.txt --separate
   python3 log_parser.py ./measure-PRB.txt -o custom_name
+
+Features:
+  - Auto-detect throughput from filename (e.g., 500M)
+  - Auto-trim stable regions at start/end
+  - Generate consistent visualizations
 
 Automatic throughput extraction:
   measure-PRB-500M.txt  -> 500 Mbps
@@ -400,7 +486,7 @@ Options:
     args = parser.parse_args()
     
     print(f"\n{'='*70}")
-    print("Log Parser for UE Size Analysis v2")
+    print("Log Parser for UE Size Analysis v3")
     print(f"{'='*70}")
     print(f"Log file: {args.log_file}")
     
@@ -421,7 +507,7 @@ Options:
     if throughput is not None:
         print(f"Throughput: {throughput} Mbps (from {'command' if args.throughput else 'filename'})")
     
-    # Print summary
+    # Print summary (with trimming info)
     print_summary(ue_data, ues_to_plot)
     
     # Generate output filename
@@ -441,11 +527,13 @@ Options:
                 filename_prefix=filename_prefix,
                 separate=True
             )
-            output_files.append(output_file)
+            if output_file:
+                output_files.append(output_file)
         
-        print(f"\nChart saved:")
-        for f in output_files:
-            print(f"   {f}")
+        if output_files:
+            print(f"\nChart saved:")
+            for f in output_files:
+                print(f"   {f}")
     else:
         # Multiple UEs combined
         output_file = plot_all_ues_combined(
